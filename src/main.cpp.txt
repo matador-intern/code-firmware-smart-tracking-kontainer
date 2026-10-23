@@ -1,0 +1,279 @@
+// ===== LoRa Receiver (Compatible with sender) =====
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ------------ LoRa pins & params (MATCH TRANSMITTER) ------------
+#define LORA_SS    5
+#define LORA_RST   13        // was 13; must match TX
+#define LORA_DIO0  25
+#define LORA_FREQ  923E6
+#define LORA_SYNC  0x34
+
+// ------------ WiFi / Influx ------------
+const char* WIFI_SSID = "MatadorDev";
+const char* WIFI_PASS = "bayardulu";
+
+// 1) InfluxDB Cloud Settings
+const char* INFLUX_URL_CLOUD = "https://us-east-1-1.aws.cloud2.influxdata.com";
+const char* INFLUX_ORG_CLOUD = "smart-ecoport";
+const char* INFLUX_BUCKET_CLOUD = "smart-ecoport";
+const char* INFLUX_TOKEN_CLOUD = "9JzSvU6X3J6JYDqYVfyFCD0I9hz2vHHBGuCg2QT2dou6A702RUGa06LJyLM0nFWyqhGLULiVnqqHNigJVvKsVQ==";
+
+// 2) InfluxDB Local Settings 
+const char* INFLUX_URL_LOCAL = "http://192.168.1.107:8086";
+const char* INFLUX_ORG_LOCAL = "smart-ecoport";
+const char* INFLUX_BUCKET_LOCAL = "smart-ecoport";
+const char* INFLUX_TOKEN_LOCAL = "ExvvBmgWjFrUMYkstUBptIC_XOX8ur4uSFRuILxW1Z_I2qGAnnUy8ir5KqCjOu-aG5TI_D_yTtcM9xs_woeAHA==";
+
+// ------------ Debug macro ------------
+#define DEBUG 1
+#if DEBUG
+  #define DBG(...)  Serial.println(__VA_ARGS__)
+#else
+  #define DBG(...)
+#endif
+
+// ======== STRUCT (MUST MATCH SENDER EXACTLY) ========
+#pragma pack(push,1)
+struct TelemetryPacket {
+  uint8_t  packetCounter;
+  uint32_t deviceID;
+  double   latitude, longitude, altitude, speed;   // double (ESP32: 8-byte)
+  uint8_t  satellites;
+  char     timeUTC[20];                            // "YYYY/MM/DD,HH:MM:SS"
+  bool     doorValue;
+  char     tujuan[14];
+  char     perusahaan[20];
+  char     isi[16];
+};
+#pragma pack(pop)
+
+TelemetryPacket rx;
+
+// ======== Helpers ========
+static void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(300); Serial.print('.');
+  }
+  Serial.println(WiFi.status()==WL_CONNECTED ? "\nWiFi OK" : "\nWiFi FAIL");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("ESP32 IP: "); Serial.println(WiFi.localIP());
+  }
+}
+
+static String escapeInfluxTag(const String& s) {
+  String out; out.reserve(s.length()+8);
+  for (size_t i=0;i<s.length();++i) {
+    char c = s[i];
+    if (c==' ' || c==',' || c=='=') out += '\\';
+    out += c;
+  }
+  return out;
+}
+
+static String escapeInfluxFieldStr(const String& s) {
+  String out; out.reserve(s.length()+8);
+  out += '"';
+  for (size_t i=0;i<s.length();++i) {
+    char c = s[i];
+    if (c=='"') out += '\\';
+    out += c;
+  }
+  out += '"';
+  return out;
+}
+
+// Helper tunggal untuk HTTP POST ke spesifik Endpoint
+static bool sendHttpPost(const char* baseUrl, const char* org, const char* bucket, const char* token, const String& lineProtocol) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  String url = String(baseUrl) + "/api/v2/write?org=" + org +
+               "&bucket=" + bucket + "&precision=ms";
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(5000);
+  http.setReuse(false);
+  http.addHeader("Connection","close");
+  http.addHeader("Content-Type", "text/plain; charset=utf-8");
+  http.addHeader("Authorization", String("Token ") + token);
+  int code = http.POST(lineProtocol);
+  bool ok = (code >= 200 && code < 300);
+  if (!ok) {
+    Serial.printf("Influx ERR (%s) %d: %s\n", baseUrl, code, http.getString().c_str());
+  }
+  http.end();
+  return ok;
+}
+
+// Dual Write ke Cloud dan Lokal
+static bool writeToInfluxDB(const String& lineProtocol) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  // 1. Kirim ke InfluxDB Cloud
+  bool cloudOk = sendHttpPost(INFLUX_URL_CLOUD, INFLUX_ORG_CLOUD, INFLUX_BUCKET_CLOUD, INFLUX_TOKEN_CLOUD, lineProtocol);
+  
+  // 2. Kirim ke InfluxDB Lokal (Laptop)
+  bool localOk = sendHttpPost(INFLUX_URL_LOCAL, INFLUX_ORG_LOCAL, INFLUX_BUCKET_LOCAL, INFLUX_TOKEN_LOCAL, lineProtocol);
+
+  if (cloudOk) Serial.println("  ├─ Cloud Write: OK");
+  else         Serial.println("  ├─ Cloud Write: FAIL");
+
+  if (localOk) Serial.println("  └─ Local Write: OK");
+  else         Serial.println("  └─ Local Write: FAIL");
+
+  return (cloudOk || localOk);
+}
+
+static void hexDump(const uint8_t* buf, int len) {
+  for (int i = 0; i < len; ++i) {
+    if (i % 16 == 0) Serial.println();
+    if (buf[i] < 16) Serial.print('0');
+    Serial.print(buf[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+// ======== Setup ========
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n📡 LoRa Receiver Node Starting...");
+
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  int tries = 0;
+  while (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init failed. Retrying...");
+    delay(400);
+    if (++tries > 20) {
+      Serial.println("LoRa init giving up. Check wiring/freq.");
+      while(1) delay(1000);
+    }
+  }
+
+  // --- Match TX settings exactly ---
+  LoRa.setSpreadingFactor(12);     // SF7..12 (higher = longer range, lower data rate)
+  LoRa.setSignalBandwidth(125E3); // 7.8k..500k (narrower = better sensitivity, lower data rate)
+  LoRa.setCodingRate4(8);         // 4/5..4/8 (higher = more robust, lower throughput)
+  LoRa.setPreambleLength(12);      // default is 8, can increase for noisy links
+  LoRa.setTxPower(20);            // dBm (2..20, PA_BOOST on RFM95W)
+  LoRa.setSyncWord(0x34);         // must match RX
+  LoRa.enableCrc();               // must match RX
+
+  Serial.println("LoRa Initialized OK! Ready to receive.");
+  connectWiFi();
+}
+
+// ======== Loop ========
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (!packetSize) { delay(2); return; }
+
+  int rssi = LoRa.packetRssi();
+  float snr = LoRa.packetSnr();
+  Serial.println("\n✅ Packet detected");
+  Serial.printf("Bytes=%d | RSSI=%d dBm | SNR=%.1f dB\n", packetSize, rssi, snr);
+
+  if (packetSize == (int)sizeof(TelemetryPacket)) {
+    memset(&rx, 0, sizeof(rx));
+    int n = LoRa.readBytes((uint8_t*)&rx, sizeof(rx));
+    while (LoRa.available()) LoRa.read(); // drain if any
+
+    if (n == sizeof(TelemetryPacket)) {
+      rx.timeUTC[sizeof(rx.timeUTC)-1] = '\0';
+
+      Serial.printf("---- RX Packet #%u ----\n", rx.packetCounter);
+      Serial.printf("Dev : %u\n",   rx.deviceID);
+      Serial.printf("Lat : %.6f\n", rx.latitude);
+      Serial.printf("Lon : %.6f\n", rx.longitude);
+      Serial.printf("Alt : %.2f m\n", rx.altitude);
+      Serial.printf("Spd : %.2f km/h\n", rx.speed);
+      Serial.printf("Sats: %u\n",   rx.satellites);
+      Serial.printf("Time: %s\n",   rx.timeUTC);
+      Serial.printf("Door: %s\n",   rx.doorValue ? "Closed" : "Open");
+      Serial.printf("Tujuan     : %s\n", rx.tujuan);
+      Serial.printf("Perusahaan : %s\n", rx.perusahaan);
+      Serial.printf("Isi        : %s\n", rx.isi);
+      Serial.println("------------------------");
+
+      // ===== JSON (debug/opsional) =====
+      String json = "{";
+      json += "\"deviceID\":" + String(rx.deviceID) + ",";
+      json += "\"packetCounter\":" + String(rx.packetCounter) + ",";
+      json += "\"rssi\":" + String(rssi) + ",";
+      json += "\"snr\":" + String(snr,1) + ",";
+      json += "\"door\":" + String(rx.doorValue ? "true" : "false") + ",";
+      json += "\"gps\":{";
+        json += "\"lat\":" + String(rx.latitude, 6) + ",";
+        json += "\"lon\":" + String(rx.longitude, 6) + ",";
+        json += "\"alt\":" + String(rx.altitude, 2) + ",";
+        json += "\"speed\":" + String(rx.speed, 2) + ",";
+        json += "\"sats\":" + String((int)rx.satellites) + ",";
+        json += "\"timeUTC\":\"" + String(rx.timeUTC) + "\"";
+      json += "},";
+      json += "\"tujuan\":\"" + String(rx.tujuan) + "\",";
+      json += "\"perusahaan\":\"" + String(rx.perusahaan) + "\",";
+      json += "\"isi\":\"" + String(rx.isi) + "\"";
+      json += "}";
+      Serial.println("JSON:");
+      Serial.println(json);
+
+      // ===== InfluxDB line protocol (Batching Telemetry + Config) =====
+      String tagDevice = String(rx.deviceID);
+      String tagTujuan = escapeInfluxTag(String(rx.tujuan));
+      String tagPerus  = escapeInfluxTag(String(rx.perusahaan));
+      String fieldIsi  = escapeInfluxFieldStr(String(rx.isi));
+
+      String lp; lp.reserve(400);
+
+      // 1. Line Protocol: Telemetry
+      lp  = "telemetry";
+      lp += ",device=";     lp += tagDevice;
+      lp += ",tujuan=";     lp += tagTujuan;
+      lp += ",perusahaan="; lp += tagPerus;
+      lp += " ";
+      lp += "packetCounter="; lp += String((int)rx.packetCounter); lp += "i,";
+      lp += "rssi=";          lp += String((int)rssi); lp += "i,";
+      lp += "snr=";           lp += String(snr,1); lp += ",";
+      lp += "door=";          lp += (rx.doorValue ? "true" : "false"); lp += ",";
+      lp += "lat=";           lp += String(rx.latitude, 6); lp += ",";
+      lp += "lon=";           lp += String(rx.longitude, 6); lp += ",";
+      lp += "alt=";           lp += String(rx.altitude, 2); lp += ",";
+      lp += "speed=";         lp += String(rx.speed, 2); lp += ",";
+      lp += "sats=";          lp += String((int)rx.satellites); lp += "i,";
+      lp += "timeUTC=";       lp += escapeInfluxFieldStr(String(rx.timeUTC)); lp += ",";
+      lp += "tujuanField=";     lp += escapeInfluxFieldStr(String(rx.tujuan));     lp += ",";
+      lp += "perusahaanField="; lp += escapeInfluxFieldStr(String(rx.perusahaan)); lp += ",";
+      lp += "isi=";           lp += fieldIsi;
+
+      // 2. Line Protocol: Config (Gabung dengan karakter newline '\n')
+      lp += "\n";
+      lp += "config,device=" + tagDevice;
+      lp += " perusahaan=" + escapeInfluxFieldStr(String(rx.perusahaan)) + ",";
+      lp += "isi=" + escapeInfluxFieldStr(String(rx.isi)) + ",";
+      lp += "tujuan=" + escapeInfluxFieldStr(String(rx.tujuan));
+
+      // Kirim sekali saja untuk kedua measurement sekaligus
+      if (!writeToInfluxDB(lp)) Serial.println("❌ Influx write failed");
+      else                      Serial.println("✅ Influx write OK (Telemetry + Config)");
+
+    } else {
+      Serial.println("Struct read incomplete, dumping partial:");
+      hexDump((const uint8_t*)&rx, n);
+    }
+  } else {
+    Serial.println("Unexpected packet size; dumping hex:");
+    static uint8_t buf[256];
+    int toRead = min(packetSize, (int)sizeof(buf));
+    int n = LoRa.readBytes(buf, toRead);
+    while (LoRa.available()) LoRa.read();
+    hexDump(buf, n);
+  }
+}

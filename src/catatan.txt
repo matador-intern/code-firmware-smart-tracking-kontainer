@@ -1,0 +1,5 @@
+1. maintx.cpp adalah kode transmitter
+2. main.cpp adalah kode receiver
+
+jika ingin upload, pastikan hanya ada satu file yang main.cpp
+misal ingin upload maintx.cpp, re-name jadi main.cpp. Namun, file main.cpp (receiver) diubah jadi .txt dahulu agar hanya ada satu file main.cpp
