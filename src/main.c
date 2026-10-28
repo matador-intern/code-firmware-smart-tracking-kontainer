@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -16,7 +15,10 @@
 #include "esp_efuse.h"
 #include "esp_mac.h"
 
+
 static const char *TAG = "TX_BARE";
+
+void handle_serial_config(void);
 
 #define PIN_LORA_SS       5
 #define PIN_LORA_RST      12
@@ -33,8 +35,6 @@ static const char *TAG = "TX_BARE";
 
 // ADC Channels
 #define ADC_CH_VIB        ADC_CHANNEL_6 // GPIO34
-#define ADC_CH_MQ7        ADC_CHANNEL_7 // GPIO35
-#define ADC_CH_MQ135      ADC_CHANNEL_4 // GPIO32
 
 #define REG_FIFO                 0x00
 #define REG_OP_MODE              0x01
@@ -55,7 +55,8 @@ static const char *TAG = "TX_BARE";
 #define REG_MODEM_CONFIG_3       0x26
 #define REG_SYNC_WORD            0x39
 #define REG_PA_DAC               0x4D
-#define REG_VERSION              0x42
+#define REG_DIO_MAPPING_1        0x40
+#define REG_DIO_MAPPING_2        0x41
 
 #define MODE_SLEEP               0x00
 #define MODE_STDBY               0x01
@@ -112,14 +113,14 @@ uint8_t lora_read_reg(uint8_t reg) {
 }
 
 void lora_init_hw(long frequency) {
-    // Reset sequence
+    // 1. Hard Reset dengan Delay Cukup
     gpio_set_direction(PIN_LORA_RST, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_LORA_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level(PIN_LORA_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    // SPI Bus Configuration - CS handled by driver
+    // 2. Init SPI Bus
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_LORA_MISO,
         .mosi_io_num = PIN_LORA_MOSI,
@@ -134,108 +135,97 @@ void lora_init_hw(long frequency) {
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = 1000000,
         .mode = 0,
-        .spics_io_num = PIN_LORA_SS,    // Driver handles CS automatically!
+        .spics_io_num = PIN_LORA_SS,
         .queue_size = 1,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &devcfg, &spi_lora));
 
-    // Verify Chip Version
-    uint8_t ver = lora_read_reg(REG_VERSION);
-    ESP_LOGI(TAG, "RFM95 Version: 0x%02X (expect 0x12)", ver);
-    if (ver != 0x12) {
-        ESP_LOGE(TAG, "LoRa module not detected!");
-        return;
-    }
-
-    // Config RF Mode & Freq
+    // 3. Masuk SLEEP Mode
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_SLEEP);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(20));
 
-    uint64_t frf = ((uint64_t)frequency << 19) / 32000000;
-    lora_write_reg(REG_FR_MSB, (uint8_t)(frf >> 16));
-    lora_write_reg(REG_FR_MID, (uint8_t)(frf >> 8));
-    lora_write_reg(REG_FR_LSB, (uint8_t)(frf >> 0));
+    // ===== MATCH EXACT DENGAN WORKING DUMP =====
+    lora_write_reg(REG_FR_MSB, 0xE6); // 923.000.000 Hz
+    lora_write_reg(REG_FR_MID, 0xC0);
+    lora_write_reg(REG_FR_LSB, 0x00);
 
     lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
     lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
 
-    lora_write_reg(REG_MODEM_CONFIG_1, 0x78); // BW=125kHz, CR=4/8, Explicit Header
+    lora_write_reg(REG_MODEM_CONFIG_1, 0x78); // BW=125kHz, CR=4/8
     lora_write_reg(REG_MODEM_CONFIG_2, 0xC4); // SF=12, CRC On
     lora_write_reg(REG_MODEM_CONFIG_3, 0x0C); // AGC Auto + LDRO=1
 
     lora_write_reg(REG_PREAMBLE_MSB, 0x00);
-    lora_write_reg(REG_PREAMBLE_LSB, 12);
+    lora_write_reg(REG_PREAMBLE_LSB, 0x0C);   // 12 Preamble
     lora_write_reg(REG_SYNC_WORD, 0x34);
 
-    lora_write_reg(REG_LNA, 0x23);       // LNA Gain Max + Boost
-    lora_write_reg(REG_OCP, 0x2B);       // OCP 100mA
-    lora_write_reg(REG_PA_CONFIG, 0x8F); // PA_BOOST Max Power (20dBm)
-    lora_write_reg(REG_PA_DAC, 0x87);    // +20dBm boost
+    lora_write_reg(0x31, 0xC3); // REG_DETECT_OPTIMIZE
+    lora_write_reg(0x37, 0x0A); // REG_DETECTION_THRESHOLD
+
+    lora_write_reg(0x33, 0x27); // REG_INVERT_IQ
+    lora_write_reg(0x3B, 0x1D); // REG_INVERT_IQ2
+
+    lora_write_reg(REG_LNA, 0x23);
+    lora_write_reg(REG_OCP, 0x3F);
+    lora_write_reg(REG_PA_CONFIG, 0x84);
+    lora_write_reg(REG_PA_DAC, 0x84);    // +20dBm (working dump value, includes PaRamp=7)
+
+    // SET DIO0 MAPPING WAJIB 0x00 (TxDone)
+    lora_write_reg(REG_DIO_MAPPING_1, 0x00); 
+    lora_write_reg(REG_DIO_MAPPING_2, 0x00);
 
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-    ESP_LOGI(TAG, "LoRa HW Initialized.");
-
-    // Preamble
-    lora_write_reg(REG_PREAMBLE_MSB, 0x00);
-    lora_write_reg(REG_PREAMBLE_LSB, 12);
-
-    // Sync word
-    lora_write_reg(REG_SYNC_WORD, 0x34);
-
-    // OCP (Over Current Protection) - 100mA
-    lora_write_reg(REG_OCP, 0x2B);
-
-    // PA config for 14dBm
-    lora_write_reg(REG_PA_CONFIG, 0x8C);  // PA_BOOST | 12
-    lora_write_reg(REG_PA_DAC, 0x84);     // No boost
-
-    // Set LDRO for SF12@125kHz (symbol duration > 16ms)
-    // Symbol duration = 1000 / (125000 / 4096) = 32.7ms > 16ms -> LDRO=1
-    lora_write_reg(REG_MODEM_CONFIG_3, 0x0C);  // auto AGC + LDRO=1
-
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-    ESP_LOGI(TAG, "LoRa HW Initialized.");
-    ESP_LOGI(TAG, "REG_MODEM_CONFIG_1: 0x%02X (expect 0x78)", lora_read_reg(REG_MODEM_CONFIG_1));
-    ESP_LOGI(TAG, "REG_MODEM_CONFIG_2: 0x%02X (expect 0xC4)", lora_read_reg(REG_MODEM_CONFIG_2));
-    ESP_LOGI(TAG, "REG_MODEM_CONFIG_3: 0x%02X (expect 0x0C)", lora_read_reg(REG_MODEM_CONFIG_3));
-    ESP_LOGI(TAG, "REG_SYNC_WORD: 0x%02X (expect 0x34)", lora_read_reg(REG_SYNC_WORD));
-    ESP_LOGI(TAG, "REG_PREAMBLE_LSB: 0x%02X (expect 0x0C)", lora_read_reg(REG_PREAMBLE_LSB));
-    ESP_LOGI(TAG, "REG_LNA: 0x%02X (expect 0x03)", lora_read_reg(REG_LNA));
-    ESP_LOGI(TAG, "REG_OCP: 0x%02X (expect 0x2B)", lora_read_reg(REG_OCP));
-    ESP_LOGI(TAG, "REG_PA_CONFIG: 0x%02X (expect 0x8F)", lora_read_reg(REG_PA_CONFIG));
-    ESP_LOGI(TAG, "REG_PA_DAC: 0x%02X (expect 0x87)", lora_read_reg(REG_PA_DAC));
+    ESP_LOGI(TAG, "LoRa HW Initialized & Synced with Working Dump.");
 }
 
 bool lora_send_packet(const uint8_t *buf, size_t len) {
+    if (len == 0 || len > 255) return false;
+
+    // 1. Standby mode
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-    lora_write_reg(REG_FIFO_ADDR_PTR, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // 2. Reset FIFO pointers
+    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
+
+    // 3. Set Payload Length
     lora_write_reg(REG_PAYLOAD_LENGTH, len);
 
-    uint8_t *fifo_buf = malloc(len + 1);
-    fifo_buf[0] = REG_FIFO | 0x80;
-    memcpy(&fifo_buf[1], buf, len);
+    // 4. Write FIFO in SINGLE SPI transaction (CS stays LOW for address + all data)
+    uint8_t tx_buf[256];
+    tx_buf[0] = REG_FIFO | 0x80;  // Write command for FIFO
+    memcpy(&tx_buf[1], buf, len);
 
-    spi_transaction_t wr = {
+    spi_transaction_t t = {
         .length = (len + 1) * 8,
-        .tx_buffer = fifo_buf,
+        .tx_buffer = tx_buf,
     };
-    esp_err_t ret = spi_device_polling_transmit(spi_lora, &wr);
-    free(fifo_buf);
+    esp_err_t ret = spi_device_polling_transmit(spi_lora, &t);
     if (ret != ESP_OK) return false;
 
+    // 5. Trigger TX (NO IRQ clear before TX - match Arduino)
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
 
+    // 6. Poll TxDone with delay (feeds watchdog)
     int timeout = 0;
-    while (!(lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK)) {
-        vTaskDelay(pdMS_TO_TICKS(2));
-        if (++timeout > 1500) {
-            ESP_LOGE(TAG, "TX Timeout");
+    while (1) {
+        uint8_t irq = lora_read_reg(REG_IRQ_FLAGS);
+        if (irq & 0x08) {  // TxDone
+            break;
+        }
+        if (++timeout > 100) {  // 5s timeout @ 50ms
+            ESP_LOGE(TAG, "TX Timeout! OP_MODE: 0x%02X, IRQ: 0x%02X", 
+                     lora_read_reg(REG_OP_MODE), irq);
             lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
             return false;
         }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    lora_write_reg(REG_IRQ_FLAGS, IRQ_TX_DONE_MASK);
+    // 7. Clear IRQ & return to STDBY (match Arduino: clear AFTER TxDone)
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
     return true;
 }
@@ -245,7 +235,6 @@ typedef struct {
     float alt, spd;
     uint8_t sats;
     char timeUTC[20];
-    bool valid;
 } GPSData;
 
 GPSData gpsData = {0};
@@ -280,7 +269,6 @@ void parse_nmea_line(char *line) {
             idx++;
         }
         if (status == 'A') {
-            gpsData.valid = true;
             gpsData.lat = nmea_to_deg(latStr, latDir);
             gpsData.lon = nmea_to_deg(lonStr, lonDir);
             gpsData.spd = atof(spdStr) * 1.852f;
@@ -316,12 +304,12 @@ void parse_nmea_line(char *line) {
 }
 
 void gps_uart_task(void *arg) {
-    uint8_t *data = malloc(256);
+    uint8_t data[256];
     char line_buf[256];
     int line_idx = 0;
 
     while (1) {
-        int len = uart_read_bytes(UART_NUM_2, data, 255, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(UART_NUM_2, data, sizeof(data) - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
             for (int i = 0; i < len; i++) {
                 char c = data[i];
@@ -339,30 +327,80 @@ void gps_uart_task(void *arg) {
     }
 }
 
-void load_config_nvs() {
+void load_config_nvs(void) {
     nvs_handle_t handle;
     if (nvs_open("cfg", NVS_READONLY, &handle) == ESP_OK) {
         size_t len;
+        
         len = sizeof(g_tujuan);
-        nvs_get_str(handle, "tujuan", g_tujuan, &len);
+        if (nvs_get_str(handle, "tujuan", g_tujuan, &len) != ESP_OK || strlen(g_tujuan) == 0) {
+            strncpy(g_tujuan, "KOTA2", sizeof(g_tujuan) - 1);
+        }
+
         len = sizeof(g_perusahaan);
-        nvs_get_str(handle, "perusahaan", g_perusahaan, &len);
+        if (nvs_get_str(handle, "perusahaan", g_perusahaan, &len) != ESP_OK || strlen(g_perusahaan) == 0) {
+            strncpy(g_perusahaan, "PT SATU", sizeof(g_perusahaan) - 1);
+        }
+
         len = sizeof(g_isi);
-        nvs_get_str(handle, "isi", g_isi, &len);
+        if (nvs_get_str(handle, "isi", g_isi, &len) != ESP_OK || strlen(g_isi) == 0) {
+            strncpy(g_isi, "ISI3", sizeof(g_isi) - 1);
+        }
+
         nvs_close(handle);
     }
+
+    // Tampilkan di terminal saat boot untuk memastikan
+    ESP_LOGI("NVS_BOOT", "Loaded Config -> Perusahaan: %s | Tujuan: %s | Isi: %s", 
+             g_perusahaan, g_tujuan, g_isi);
 }
+
+// Fungsi untuk menyimpan konfigurasi baru dari GUI ke NVS
+void save_config_nvs(const char* tujuan, const char* perusahaan, const char* isi) {
+    nvs_handle_t handle;
+    // Buka namespace "cfg" dengan mode BACA & TULIS (NVS_READWRITE)
+    if (nvs_open("cfg", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_str(handle, "tujuan", tujuan);
+        nvs_set_str(handle, "perusahaan", perusahaan);
+        nvs_set_str(handle, "isi", isi);
+        
+        nvs_commit(handle); // Tulis permanen ke Flash
+        nvs_close(handle);
+        
+        // LANGSUNG Update variabel global di RAM agar saat pengiriman LoRa berikutnya data baru terpakai!
+        strncpy(g_tujuan, tujuan, sizeof(g_tujuan) - 1);
+        strncpy(g_perusahaan, perusahaan, sizeof(g_perusahaan) - 1);
+        strncpy(g_isi, isi, sizeof(g_isi) - 1);
+
+        ESP_LOGI("NVS", "Config updated: Perusahaan=%s, Tujuan=%s, Isi=%s", g_perusahaan, g_tujuan, g_isi);
+    }
+}
+
+
 
 void app_main(void) {
     ESP_LOGI(TAG, "=== ESP32 Bare Metal Transmitter Starting ===");
 
-    ESP_ERROR_CHECK(nvs_flash_init());
+    // 1. Inisialisasi NVS (Sudah HAPUS nvs_flash_erase() agar data dari GUI tersimpan permanen)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Baca konfigurasi NVS saat boot awal
     load_config_nvs();
 
+    // 2. Install Driver UART0 (USB Serial) agar handle_serial_config() bisa menerima JSON dari GUI Laptop
+    uart_driver_install(UART_NUM_0, 512, 0, 0, NULL, 0);
+
+    // Ambil MAC Address untuk DeviceID
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
     dataToSend.deviceID = (mac[3] << 16) | (mac[4] << 8) | mac[5];
 
+    // Konfigurasi GPIO Hardware
     gpio_set_direction(PIN_GPS_EN, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_GPS_EN, 0);
     gpio_set_direction(PIN_MAGNETIC, GPIO_MODE_INPUT);
@@ -379,9 +417,8 @@ void app_main(void) {
         .atten = ADC_ATTEN_DB_12,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CH_VIB, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CH_MQ7, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CH_MQ135, &config));
 
+    // Konfigurasi UART2 (GPS Module)
     uart_config_t uart_cfg = {
         .baud_rate = 9600,
         .data_bits = UART_DATA_8_BITS,
@@ -394,8 +431,13 @@ void app_main(void) {
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, PIN_GPS_TX, PIN_GPS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_2, 1024, 0, 0, NULL, 0));
 
+    // Inisialisasi LoRa Hardware
     lora_init_hw(923000000);
 
+    // Tunggu kestabilan osilator LoRa
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Jalankan Task GPS
     xTaskCreatePinnedToCore(gps_uart_task, "gps_uart", 4096, NULL, 5, NULL, 1);
 
     ESP_LOGI(TAG, "System Ready. DeviceID: %lu", (unsigned long)dataToSend.deviceID);
@@ -403,8 +445,12 @@ void app_main(void) {
     uint8_t packetCounter = 0;
     int64_t lastSend = 0;
     int lastDoor = 1;
+    int64_t lastPeriodicSend = esp_timer_get_time() / 1000;
 
     while (1) {
+        // Cek input JSON dari aplikasi GUI Serial setiap perulangan
+        handle_serial_config();
+
         int64_t now = esp_timer_get_time() / 1000;
 
         int vibVal = 0;
@@ -423,33 +469,38 @@ void app_main(void) {
             lastDebug = now;
         }
 
-        // Periodic test send every 10 seconds (for link verification)
-        static int64_t lastPeriodicSend = 0;
+        // Periodic trigger every 10 seconds
         bool periodicSend = (now - lastPeriodicSend >= 10000);
         if (periodicSend) {
             lastPeriodicSend = now;
-            ESP_LOGI(TAG, "Periodic test send...");
         }
 
+        // Pemicuan Pengiriman Paket Data Utama
         if (((vibDetected && (now - lastSend >= 5000)) || doorTrigger || periodicSend)) {
             packetCounter++;
             dataToSend.packetCounter = packetCounter;
-            dataToSend.latitude = gpsData.lat;
-            dataToSend.longitude = gpsData.lon;
-            dataToSend.altitude = gpsData.alt;
-            dataToSend.speed = gpsData.spd;
-            dataToSend.satellites = gpsData.sats;
-            strncpy(dataToSend.timeUTC, gpsData.timeUTC, sizeof(dataToSend.timeUTC)-1);
-            dataToSend.timeUTC[sizeof(dataToSend.timeUTC)-1] = '\0';
-            strncpy(dataToSend.tujuan, g_tujuan, sizeof(dataToSend.tujuan)-1);
-            dataToSend.tujuan[sizeof(dataToSend.tujuan)-1] = '\0';
-            strncpy(dataToSend.perusahaan, g_perusahaan, sizeof(dataToSend.perusahaan)-1);
-            dataToSend.perusahaan[sizeof(dataToSend.perusahaan)-1] = '\0';
-            strncpy(dataToSend.isi, g_isi, sizeof(dataToSend.isi)-1);
-            dataToSend.isi[sizeof(dataToSend.isi)-1] = '\0';
+            dataToSend.latitude     = gpsData.lat;
+            dataToSend.longitude    = gpsData.lon;
+            dataToSend.altitude     = gpsData.alt;
+            dataToSend.speed        = gpsData.spd;
+            dataToSend.satellites   = gpsData.sats;
+            dataToSend.doorValue    = (doorNow == 1);
 
-            ESP_LOGI(TAG, "TX #%u | Lat: %.6f Lon: %.6f Sats: %d Door: %d",
-                     packetCounter, gpsData.lat, gpsData.lon, gpsData.sats, dataToSend.doorValue);
+            strncpy(dataToSend.timeUTC, gpsData.timeUTC, sizeof(dataToSend.timeUTC) - 1);
+            dataToSend.timeUTC[sizeof(dataToSend.timeUTC) - 1] = '\0';
+
+            // Ambil data NVS terbaru yang tersimpan di g_tujuan, g_perusahaan, g_isi
+            strncpy(dataToSend.tujuan, g_tujuan, sizeof(dataToSend.tujuan) - 1);
+            dataToSend.tujuan[sizeof(dataToSend.tujuan) - 1] = '\0';
+
+            strncpy(dataToSend.perusahaan, g_perusahaan, sizeof(dataToSend.perusahaan) - 1);
+            dataToSend.perusahaan[sizeof(dataToSend.perusahaan) - 1] = '\0';
+
+            strncpy(dataToSend.isi, g_isi, sizeof(dataToSend.isi) - 1);
+            dataToSend.isi[sizeof(dataToSend.isi) - 1] = '\0';
+
+            ESP_LOGI(TAG, "TX #%u | Perusahaan: %s | Tujuan: %s | Isi: %s",
+                     packetCounter, dataToSend.perusahaan, dataToSend.tujuan, dataToSend.isi);
 
             if (lora_send_packet((uint8_t*)&dataToSend, sizeof(dataToSend))) {
                 ESP_LOGI(TAG, "LoRa TX OK");
@@ -461,4 +512,50 @@ void app_main(void) {
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+}
+
+// Parser JSON sederhana tanpa static buffer (aman dari bug overwrite)
+static bool json_get_field(const char *json, const char *key, char *out_val, size_t max_len) {
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    k = strchr(k, ':'); if (!k) return false;
+    k = strchr(k, '"'); if (!k) return false;
+    k++;
+    const char *e = strchr(k, '"'); if (!e) return false;
+    
+    size_t len = e - k;
+    if (len >= max_len) len = max_len - 1;
+    memcpy(out_val, k, len);
+    out_val[len] = '\0';
+    return true;
+}
+
+// Handler penerima Serial dari GUI
+void handle_serial_config(void) {
+    uint8_t buf[256];
+    int len = uart_read_bytes(UART_NUM_0, buf, sizeof(buf) - 1, 0);
+    if (len <= 0) return;
+    buf[len] = '\0';
+
+    char *start = (char*)buf;
+    while (*start && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) start++;
+    char *end = start + strlen(start) - 1;
+    while (end > start && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) *end-- = '\0';
+    if (*start == '\0') return;
+
+    char tujuan[16] = {0};
+    char perusahaan[24] = {0};
+    char isi[20] = {0};
+
+    bool ok_t = json_get_field(start, "tujuan", tujuan, sizeof(tujuan));
+    bool ok_p = json_get_field(start, "perusahaan", perusahaan, sizeof(perusahaan));
+    bool ok_i = json_get_field(start, "isi", isi, sizeof(isi));
+
+    if (!ok_t || !ok_p || !ok_i) {
+        ESP_LOGW("NVS", "Missing fields in JSON input");
+        return;
+    }
+
+    save_config_nvs(tujuan, perusahaan, isi);
+    ESP_LOGI("NVS", "Config update OK -> P:%s | T:%s | I:%s", perusahaan, tujuan, isi);
 }
